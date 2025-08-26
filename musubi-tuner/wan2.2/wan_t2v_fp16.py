@@ -469,10 +469,10 @@ class WanGenerate:
         # vae 先加载到 CPU 上
         self.vae = self.load_vae(loading_device="cpu")
 
-        # 测试加载 LoRA
-        self.generate_from_file_with_lora(
-            self.args.prompt, self.args.lora_weight, self.args.lora_weight_high_noise
-        )
+        # # 测试加载 LoRA
+        # self.generate_from_file_with_lora(
+        #     self.args.prompt, self.args.lora_weight, self.args.lora_weight_high_noise
+        # )
 
         # low noise 后被使用，加载到 CPU 上
         start_time = time.time()
@@ -492,8 +492,8 @@ class WanGenerate:
         )
         end_time = time.time()
         print(f"load dit high noise model to cpu time: {end_time - start_time} seconds")
+        # 顺序是先高噪声后低噪声
         self.models = [self.dit_high_noise_model, self.dit_low_noise_model]
-        # self.models = [self.dit_low_noise_model, self.dit_high_noise_model]
 
         print("low noise model device: ", self.dit_low_noise_model.device)
         print("high noise model device: ", self.dit_high_noise_model.device)
@@ -572,7 +572,6 @@ class WanGenerate:
             lora_multipliers=lora_multipliers,
             use_scaled_mm=self.args.fp8_fast,
         )
-        # model = model.to(self.device)
         model.eval().requires_grad_(False)
         clean_memory_on_device(self.device)
         return model
@@ -590,12 +589,6 @@ class WanGenerate:
             create_subdir=not one_frame_inference,
         )
         return image_paths
-
-    # def load_lora(self, lora_weight, lora_weight_high_noise=None):
-    #     if lora_weight is not None:
-    #         self.dit_low_noise_model = load_lora_model(self.dit_low_noise_model, lora_weight, lora_multiplier)
-    #     if lora_weight_high_noise is not None:
-    #         self.dit_high_noise_model = load_lora_model(self.dit_high_noise_model, lora_weight_high_noise, lora_multiplier_high_noise)
 
 
 class WanGenerateImageClass(WanGenerate):
@@ -615,10 +608,8 @@ class WanGenerateImageClass(WanGenerate):
         return noise, inputs
 
     def encode_prompt(self, prompt):
-        # input("before encode prompt")
         self.text_encoder.model = self.text_encoder.model.to(self.device)
         encoded_context = self.text_encoder([prompt], self.device)
-        # input("after encode prompt")
         self.text_encoder.model = self.text_encoder.model.to("cpu")
         return encoded_context
 
@@ -647,16 +638,9 @@ class WanGenerateImageClass(WanGenerate):
         else:
             noise, inputs = self.prepare_inputs(seed, prompt)
 
-        # noise, inputs = prepare_t2v_inputs(self.args, self.cfg, self.accelerator, self.device, self.vae)
-
         latent = noise
         arg_c, arg_null = inputs
 
-        # self.models[0].to(self.device)
-        # return run_sampling(self.models, noise, scheduler, timesteps, self.args, self.gen_settings, inputs, self.device, seed_g, self.accelerator, is_i2v=False)
-
-        # latent_storage_device = device if not use_cpu_offload else "cpu"
-        # latent = latent.to(latent_storage_device)
         # dit sampling
         prev_high_noise = self.args.timestep_boundary is not None
 
@@ -669,11 +653,9 @@ class WanGenerateImageClass(WanGenerate):
         logger.info(
             f"Starting sampling (high noise: {prev_high_noise}). Models: {len(self.models)}, timestep boundary: {self.args.timestep_boundary}, flow shift: {self.args.flow_shift}, guidance scale: {self.args.guidance_scale}"
         )
-        # import pdb; pdb.set_trace()
         model.to(self.device)
 
         for i, t in enumerate(tqdm(timesteps)):
-            # print('i, t', i, t, t/1000.0, self.args.timestep_boundary, timesteps)
             is_high_noise = (
                 (t / 1000.0) >= self.args.timestep_boundary
                 if self.args.timestep_boundary is not None
@@ -686,7 +668,6 @@ class WanGenerateImageClass(WanGenerate):
                     f"Switching to low noise at step {i}, t={t}, guidance_scale={guidance_scale}"
                 )
 
-                # del model
                 model.to("cpu")
                 gc.collect()
 
@@ -822,10 +803,7 @@ class WanGenerateImageClass(WanGenerate):
                 save_name = f"prompt-{str(prompt_index).zfill(3)}_{save_name}"
             if lora_name is not None:
                 save_name = f"{lora_name}_{save_name}"
-            # save_path = os.path.join(self.args.original_save_dir, save_name)
-            # self.args.save_path = save_path
 
-            # save_images(images, self.args, original_base_name=save_name)
             save_path = self.save_image(images, self.args.save_path, save_name)
             txt_save_path = save_path[0].replace(".png", ".txt")
             with open(txt_save_path, "w") as f:
@@ -857,8 +835,13 @@ class WanGenerateImageClass(WanGenerate):
             prompts = []
             for file in os.listdir(file_path):
                 if file.endswith(".txt"):
-                    with open(os.path.join(file_path, file), "r") as f:
-                        prompts.extend(f.read().splitlines())
+                    if os.path.exists(
+                        os.path.join(file_path, file.replace(".txt", ".png"))
+                    ) or os.path.exists(
+                        os.path.join(file_path, file.replace(".txt", ".jpg"))
+                    ):
+                        with open(os.path.join(file_path, file), "r") as f:
+                            prompts.extend(f.read().splitlines())
         else:
             with open(file_path, "r") as f:
                 prompts = f.read().splitlines()
@@ -872,9 +855,7 @@ class WanGenerateImageClass(WanGenerate):
                 prompts.remove(prompt)
                 continue
 
-        # no lora
-        # for prompt_index, prompt in enumerate(prompts):
-        #     self.generate_seeds_images(prompt, prompt_index=prompt_index)
+        prompts = prompts[:1]
 
         lora_paths = glob.glob(os.path.join(lora_weight_dir[0], "*.safetensors"))
         lora_paths.sort()
@@ -882,15 +863,31 @@ class WanGenerateImageClass(WanGenerate):
             os.path.join(lora_weight_high_noise_dir[0], "*.safetensors")
         )
         lora_weight_high_noise_paths.sort()
+        if hasattr(self, "dit_low_noise_model"):
+            self.dit_low_noise_model = None
+        if hasattr(self, "dit_high_noise_model"):
+            self.dit_high_noise_model = None
+
         if hasattr(self, "models"):
-            while len(self.models) > 0:
-                del self.models[0]
+            del self.models
 
         for lora_path, lora_weight_high_noise_path in zip(
             lora_paths, lora_weight_high_noise_paths
         ):
+
+            self.dit_low_noise_model = None
+            self.dit_high_noise_model = None
+            if hasattr(self, "models"):
+                del self.models
+            self.models = []
+
             # 加载 LoRA
             # 加载低噪声模型
+            print(
+                "############ LoRA forward Load low noise model from: ",
+                self.args.dit,
+                lora_path,
+            )
             low_noise_lora_weights_list = self.prepare_lora_weghts_list([lora_path])
             self.dit_low_noise_model = self.load_dit_model(
                 self.args.dit,
@@ -901,11 +898,16 @@ class WanGenerateImageClass(WanGenerate):
                 lora_multipliers=[1.0],
             )
             # 加载高噪声模型
+            print(
+                "############ LoRA forward Load high noise model from: ",
+                self.args.dit_high_noise,
+                lora_weight_high_noise_path,
+            )
             high_noise_lora_weights_list = self.prepare_lora_weghts_list(
                 [lora_weight_high_noise_path]
             )
             self.dit_high_noise_model = self.load_dit_model(
-                self.args.dit,
+                self.args.dit_high_noise,
                 self.dit_weight_dtype,
                 "cpu",
                 self.dit_weight_dtype,
@@ -913,6 +915,7 @@ class WanGenerateImageClass(WanGenerate):
                 lora_multipliers=[1.0],
             )
             self.models = [self.dit_high_noise_model, self.dit_low_noise_model]
+            print("############ LoRA model loaded ############")
             # 生成图片
             for prompt_index, prompt in enumerate(prompts):
                 save_path = os.path.join(
