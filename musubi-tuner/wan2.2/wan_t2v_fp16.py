@@ -3,6 +3,7 @@
 import argparse
 from datetime import datetime
 import gc
+import glob
 import random
 import os
 import re
@@ -457,10 +458,21 @@ class WanGenerate:
         self.config = self.cfg
         print("self.device: ", self.device)
 
+        self.n_prompt = (
+            self.args.negative_prompt
+            if self.args.negative_prompt
+            else self.config.sample_neg_prompt
+        )
+
         # t5 先加载到 CPU 上
         self.text_encoder = self.load_t5(loading_device="cpu")
         # vae 先加载到 CPU 上
         self.vae = self.load_vae(loading_device="cpu")
+
+        # 测试加载 LoRA
+        self.generate_from_file_with_lora(
+            self.args.prompt, self.args.lora_weight, self.args.lora_weight_high_noise
+        )
 
         # low noise 后被使用，加载到 CPU 上
         start_time = time.time()
@@ -487,9 +499,6 @@ class WanGenerate:
         print("high noise model device: ", self.dit_high_noise_model.device)
         print("text encoder device: ", self.text_encoder.device)
         print("vae device: ", self.vae.device)
-        self.scheduler = setup_scheduler(
-            self.args, self.gen_settings.cfg, self.gen_settings.device
-        )
 
     def load_vae(self, loading_device):
         vae = WanVAE(
@@ -524,6 +533,20 @@ class WanGenerate:
 
         return text_encoder
 
+    def prepare_lora_weghts_list(self, lora_weights):
+        if lora_weights is not None and len(lora_weights) > 0:
+            lora_weights_list = []
+            for lora_weight in lora_weights:
+                logger.info(f"Loading LoRA weight from: {lora_weight}")
+                lora_sd = load_file(lora_weight)  # load on CPU, dtype is as is
+                lora_sd = filter_lora_state_dict(
+                    lora_sd, self.args.include_patterns, self.args.exclude_patterns
+                )
+                lora_weights_list.append(lora_sd)
+        else:
+            lora_weights_list = None
+        return lora_weights_list
+
     def load_dit_model(
         self,
         dit_path,
@@ -534,7 +557,8 @@ class WanGenerate:
         lora_multipliers=None,
         is_from_image=False,
     ):
-        # 仅加载 dit 模型
+
+        # 加载 dit 模型
         model = load_wan_model(
             self.config,
             loading_device,
@@ -558,24 +582,26 @@ class WanGenerate:
         one_frame_inference = (
             sample.shape[2] == 1
         )  # check if one frame inference is used
-        save_images_grid(
+        image_paths = save_images_grid(
             sample,
             save_path,
             image_name,
             rescale=True,
             create_subdir=not one_frame_inference,
         )
-        return save_path
+        return image_paths
+
+    # def load_lora(self, lora_weight, lora_weight_high_noise=None):
+    #     if lora_weight is not None:
+    #         self.dit_low_noise_model = load_lora_model(self.dit_low_noise_model, lora_weight, lora_multiplier)
+    #     if lora_weight_high_noise is not None:
+    #         self.dit_high_noise_model = load_lora_model(self.dit_high_noise_model, lora_weight_high_noise, lora_multiplier_high_noise)
 
 
 class WanGenerateImageClass(WanGenerate):
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
-        self.n_prompt = (
-            args.negative_prompt
-            if args.negative_prompt
-            else self.config.sample_neg_prompt
-        )
+        pass
 
     def prepare_inputs(self, seed, encoded_context):
         noise, inputs = prepare_t2v_inputs(
@@ -776,7 +802,7 @@ class WanGenerateImageClass(WanGenerate):
         clean_memory_on_device(self.device)
         return latent
 
-    def generate_seeds_images(self, prompt: str, prompt_index: int):
+    def generate_seeds_images(self, prompt: str, prompt_index=None, lora_name=None):
         seeds = [0, 42, 666, 3407]
 
         # 编码 prompt
@@ -790,12 +816,20 @@ class WanGenerateImageClass(WanGenerate):
             start_time = time.time()
             latents = self.generate_single_image(prompt, seed)
             images = self.decode_latent(latents)
-            save_name = f"prompt-{str(prompt_index).zfill(3)}_seed-{str(seed).zfill(5)}"
+
+            save_name = f"seed-{str(seed).zfill(5)}"
+            if prompt_index is not None:
+                save_name = f"prompt-{str(prompt_index).zfill(3)}_{save_name}"
+            if lora_name is not None:
+                save_name = f"{lora_name}_{save_name}"
             # save_path = os.path.join(self.args.original_save_dir, save_name)
             # self.args.save_path = save_path
 
             # save_images(images, self.args, original_base_name=save_name)
             save_path = self.save_image(images, self.args.save_path, save_name)
+            txt_save_path = save_path[0].replace(".png", ".txt")
+            with open(txt_save_path, "w") as f:
+                f.write(prompt)
             end_time = time.time()
             print(f"generate single image time: {end_time - start_time} seconds")
             print(f"image save path: {save_path}")
@@ -815,6 +849,80 @@ class WanGenerateImageClass(WanGenerate):
 
         for prompt_index, prompt in enumerate(prompts):
             self.generate_seeds_images(prompt, prompt_index=prompt_index)
+
+    def generate_from_file_with_lora(
+        self, file_path: str, lora_weight_dir: str, lora_weight_high_noise_dir: str
+    ):
+        if os.path.isdir(file_path):
+            prompts = []
+            for file in os.listdir(file_path):
+                if file.endswith(".txt"):
+                    with open(os.path.join(file_path, file), "r") as f:
+                        prompts.extend(f.read().splitlines())
+        else:
+            with open(file_path, "r") as f:
+                prompts = f.read().splitlines()
+
+        for prompt_index, prompt in enumerate(prompts[:]):
+            if prompt.startswith("# "):
+                prompts.remove(prompt)
+                continue
+
+            if not prompt.strip():
+                prompts.remove(prompt)
+                continue
+
+        # no lora
+        # for prompt_index, prompt in enumerate(prompts):
+        #     self.generate_seeds_images(prompt, prompt_index=prompt_index)
+
+        lora_paths = glob.glob(os.path.join(lora_weight_dir[0], "*.safetensors"))
+        lora_paths.sort()
+        lora_weight_high_noise_paths = glob.glob(
+            os.path.join(lora_weight_high_noise_dir[0], "*.safetensors")
+        )
+        lora_weight_high_noise_paths.sort()
+        if hasattr(self, "models"):
+            while len(self.models) > 0:
+                del self.models[0]
+
+        for lora_path, lora_weight_high_noise_path in zip(
+            lora_paths, lora_weight_high_noise_paths
+        ):
+            # 加载 LoRA
+            # 加载低噪声模型
+            low_noise_lora_weights_list = self.prepare_lora_weghts_list([lora_path])
+            self.dit_low_noise_model = self.load_dit_model(
+                self.args.dit,
+                self.dit_weight_dtype,
+                "cpu",
+                self.dit_weight_dtype,
+                lora_weights_list=low_noise_lora_weights_list,
+                lora_multipliers=[1.0],
+            )
+            # 加载高噪声模型
+            high_noise_lora_weights_list = self.prepare_lora_weghts_list(
+                [lora_weight_high_noise_path]
+            )
+            self.dit_high_noise_model = self.load_dit_model(
+                self.args.dit,
+                self.dit_weight_dtype,
+                "cpu",
+                self.dit_weight_dtype,
+                lora_weights_list=high_noise_lora_weights_list,
+                lora_multipliers=[1.0],
+            )
+            self.models = [self.dit_high_noise_model, self.dit_low_noise_model]
+            # 生成图片
+            for prompt_index, prompt in enumerate(prompts):
+                save_path = os.path.join(
+                    self.args.original_save_dir, f"prompt-{str(prompt_index).zfill(3)}"
+                )
+                self.args.save_path = save_path
+                self.generate_seeds_images(
+                    prompt,
+                    lora_name=lora_path.split("/")[-1].replace(".safetensors", ""),
+                )
 
     def decode_latent(self, latent):
         latent = latent.to(self.device)
@@ -1269,6 +1377,13 @@ if __name__ == "__main__":
     args = setup_args(args)
 
     wan_generate_image_class = WanGenerateImageClass(args)
+
+    # test lora
+    wan_generate_image_class.generate_from_file_with_lora(
+        args.prompt, args.lora_weight, args.lora_weight_high_noise
+    )
+    exit(-1)
+
     # input prompt is a txt file path
     wan_generate_image_class.generate_from_file(args.prompt)
     exit(-1)
